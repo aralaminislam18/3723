@@ -185,3 +185,18 @@ async function sendOneSignalPush({ externalId, headings, contents, data }) {
 }
 
 console.log("Meetlity OneSignal push server running — watching for new messages...");
+
+// ---- Minimal HTTP server so Render (or any host expecting a Web Service)
+// detects an open port and doesn't spin the deploy down as unhealthy. This
+// process is really a background worker, not a web app — this endpoint is
+// just a health check.
+const http = require("http");
+const PORT = process.env.PORT || 3000;
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("Meetlity push server is running.\n");
+  })
+  .listen(PORT, () => {
+    console.log(`Health check server listening on port ${PORT}`);
+  });
