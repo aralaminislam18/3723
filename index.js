@@ -41,7 +41,7 @@ const serviceAccount = require("./service-account.json");
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  databaseUrl: FIREBASE_DATABASE_URL,
+  databaseURL: FIREBASE_DATABASE_URL,
 });
 
 const db = admin.database();
