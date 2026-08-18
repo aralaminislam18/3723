@@ -46,10 +46,53 @@ admin.initializeApp({
 
 const db = admin.database();
 
-// Only handles messages created after this process started, same as a
-// Cloud Function trigger would — avoids re-notifying the entire history
-// on every restart.
-const startedAt = Date.now();
+// ---- Recovery of missed events while the server was asleep/offline -------
+// Instead of only remembering "when this process started" in memory (which
+// is lost on every restart), we persist the last-processed timestamp to
+// Firebase itself, under a small bookkeeping node. On every restart we load
+// it back, so messages/notifications that arrived while the server was down
+// (e.g. Render free-tier spin-down) still get a push once it wakes up.
+const CURSOR_PATH = "/_pushServerState/lastProcessedAt";
+const cursorRef = db.ref(CURSOR_PATH);
+
+let lastProcessedAt = 0; // will be loaded from Firebase below
+let cursorLoaded = false;
+const pendingBeforeLoad = []; // events that arrive before the cursor finishes loading
+
+async function loadCursor() {
+  try {
+    const snap = await cursorRef.get();
+    const saved = snap.val();
+    // First run ever (no cursor saved yet): start from "now" so we don't
+    // replay the app's entire historical message/notification backlog.
+    lastProcessedAt = typeof saved === "number" ? saved : Date.now();
+  } catch (err) {
+    console.error("Failed to load push-server cursor, defaulting to now:", err);
+    lastProcessedAt = Date.now();
+  }
+  cursorLoaded = true;
+  console.log(
+    `Resuming from cursor: ${new Date(lastProcessedAt).toISOString()} (recovering anything missed since then)`
+  );
+}
+
+// Advance and persist the cursor. Called after successfully handling each
+// event so a crash/restart resumes from roughly where it left off.
+let saveQueued = false;
+function advanceCursor(timestamp) {
+  if (!timestamp || timestamp <= lastProcessedAt) return;
+  lastProcessedAt = timestamp;
+  if (saveQueued) return; // coalesce rapid-fire saves into one write
+  saveQueued = true;
+  setTimeout(() => {
+    saveQueued = false;
+    cursorRef.set(lastProcessedAt).catch((err) => {
+      console.error("Failed to save push-server cursor:", err);
+    });
+  }, 2000);
+}
+
+const startedAt = Date.now(); // still used as a fallback for events with no timestamp field
 
 const messagesRef = db.ref("/users");
 
@@ -65,7 +108,8 @@ messagesRef.on("child_added", (userSnap) => {
       const messageId = msgSnap.key;
       const message = msgSnap.val();
       if (!message || !message.senderUid) return;
-      if (message.timestamp && message.timestamp < startedAt) return; // skip old history
+      const ts = message.timestamp || startedAt;
+      if (ts < lastProcessedAt) return; // already handled before restart, or genuinely old history
 
       // Same de-dup rule as the original Cloud Function: only the
       // sender's own copy of the message triggers a push.
@@ -96,6 +140,7 @@ messagesRef.on("child_added", (userSnap) => {
             messageId,
           },
         });
+        advanceCursor(ts);
       } catch (err) {
         console.error("Push send failed", err);
       }
@@ -200,3 +245,26 @@ http
   .listen(PORT, () => {
     console.log(`Health check server listening on port ${PORT}`);
   });
+
+// ---- Self-ping to prevent Render's free tier from spinning this service
+// down after 15 minutes of inactivity. Every 2 minutes, the server makes
+// an HTTP request to its own public URL. Render sees this as inbound
+// traffic and keeps the instance awake, so we don't depend on an external
+// uptime-monitoring service.
+//
+// Set SELF_PING_URL as an environment variable to your Render URL, e.g.
+// https://three723.onrender.com  (no trailing slash).
+const SELF_PING_URL = process.env.SELF_PING_URL;
+if (SELF_PING_URL) {
+  const PING_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes — safely under Render's 15-min spin-down
+  setInterval(() => {
+    fetch(SELF_PING_URL)
+      .then(() => console.log(`Self-ping OK (${new Date().toISOString()})`))
+      .catch((err) => console.error("Self-ping failed:", err.message));
+  }, PING_INTERVAL_MS);
+  console.log(`Self-ping enabled — pinging ${SELF_PING_URL} every 2 minutes.`);
+} else {
+  console.warn(
+    "SELF_PING_URL not set — this service will spin down after 15 min of inactivity unless something else pings it (e.g. UptimeRobot)."
+  );
+}
