@@ -1,0 +1,17 @@
+{
+  "name": "meetlity-onesignal-push-server",
+  "version": "1.0.0",
+  "description": "Free (no Blaze plan) push-notification sender for Meetlity, using OneSignal instead of Firebase Cloud Functions.",
+  "main": "index.js",
+  "engines": {
+    "node": "20"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.1.0",
+    "node-fetch": "^2.7.0"
+  },
+  "private": true
+}
