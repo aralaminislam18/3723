@@ -12,12 +12,14 @@
  *   3. Also listens for new in-app notifications (likes, comments,
  *      reactions, friend requests, etc.):
  *      /users/{userUid}/notifications/{notificationId}
- *   4. Sends a push through OneSignal's REST API, targeting the recipient
+ *   4. Also listens for new incoming calls:
+ *      /users/{userUid}/callInbox/{callId}
+ *   5. Sends a push through OneSignal's REST API, targeting the recipient
  *      by external_id == their Firebase uid (set on the Android side via
  *      OneSignal.login(uid) — already wired into MainActivity).
  *
- * Nothing here writes or modifies message data — it only reads what the
- * app already wrote and asks OneSignal to deliver a push about it.
+ * Nothing here writes or modifies message/call data — it only reads what
+ * the app already wrote and asks OneSignal to deliver a push about it.
  */
 
 const admin = require("firebase-admin");
@@ -52,6 +54,12 @@ const db = admin.database();
 // Firebase itself, under a small bookkeeping node. On every restart we load
 // it back, so messages/notifications that arrived while the server was down
 // (e.g. Render free-tier spin-down) still get a push once it wakes up.
+//
+// NOTE: calls are intentionally NOT covered by this cursor (see the
+// callInbox listener below) — a call push that arrives late, after the
+// caller has already given up and hung up, is worse than no push at all,
+// so calls only ever use the in-memory startedAt cutoff, never replayed
+// after a restart.
 const CURSOR_PATH = "/_pushServerState/lastProcessedAt";
 const cursorRef = db.ref(CURSOR_PATH);
 
@@ -175,6 +183,55 @@ messagesRef.on("child_added", (userSnap) => {
       console.error("Notification push send failed", err);
     }
   });
+
+  // --- Incoming calls -> push so IncomingCallActivity can pop over the
+  // lock screen even with the app fully killed (see
+  // CallSignalingRepository: users/{calleeUid}/callInbox/{callId} is
+  // written the moment a call starts, mirroring users/{calleeUid}/calls
+  // /{callId} which holds the actual caller info + offer).
+  //
+  // callInbox's value is just a timestamp (see startCall in
+  // CallSignalingRepository), so the caller's name/avatar/type are read
+  // from the sibling calls/{callId} doc, same as the Android app does.
+  //
+  // The WebRTC offer SDP itself is deliberately left OUT of the push data
+  // — SDPs can run several KB and risk truncation/rejection at OneSignal's
+  // payload limit. IncomingCallActivity already listens live to the call
+  // doc in Firebase, so it reads the offer from there once it's on
+  // screen rather than needing it in the push.
+  const callInboxRef = db.ref(`/users/${userUid}/callInbox`);
+  callInboxRef.on("child_added", async (callSnap) => {
+    const callId = callSnap.key;
+    const inboxTimestamp = callSnap.val();
+    // Only push for calls that started after this process came up — an
+    // old/stale call ringing on a dead server is worse than not ringing.
+    if (typeof inboxTimestamp === "number" && inboxTimestamp < startedAt) return;
+
+    try {
+      const callSnapFull = await db.ref(`/users/${userUid}/calls/${callId}`).get();
+      const call = callSnapFull.val();
+      if (!call || call.status !== "ringing") return; // already answered/rejected/ended
+
+      const callerUid = call.callerId;
+      if (!callerUid || callerUid === userUid) return;
+
+      await sendOneSignalPush({
+        externalId: userUid,
+        headings: call.callerName || "Meetlity",
+        contents: call.type === "video" ? "Incoming video call" : "Incoming audio call",
+        data: {
+          callId,
+          callerUid,
+          callerName: call.callerName || null,
+          callerAvatarUrl: call.callerAvatarUrl || null,
+          callType: call.type || "audio",
+        },
+        priority: 10, // ring pushes should preempt normal delivery queueing
+      });
+    } catch (err) {
+      console.error("Call push send failed", err);
+    }
+  });
 });
 
 function describeNotification(notif, fromName) {
@@ -205,7 +262,7 @@ function describeNotification(notif, fromName) {
   }
 }
 
-async function sendOneSignalPush({ externalId, headings, contents, data }) {
+async function sendOneSignalPush({ externalId, headings, contents, data, priority }) {
   const res = await fetch("https://onesignal.com/api/v1/notifications", {
     method: "POST",
     headers: {
@@ -219,6 +276,7 @@ async function sendOneSignalPush({ externalId, headings, contents, data }) {
       headings: { en: headings },
       contents: { en: contents },
       data,
+      ...(priority ? { priority } : {}),
     }),
   });
   const body = await res.json();
@@ -229,7 +287,7 @@ async function sendOneSignalPush({ externalId, headings, contents, data }) {
   }
 }
 
-console.log("Meetlity OneSignal push server running — watching for new messages...");
+console.log("Meetlity OneSignal push server running — watching for new messages, notifications, and calls...");
 
 // ---- Minimal HTTP server so Render (or any host expecting a Web Service)
 // detects an open port and doesn't spin the deploy down as unhealthy. This
@@ -268,3 +326,5 @@ if (SELF_PING_URL) {
     "SELF_PING_URL not set — this service will spin down after 15 min of inactivity unless something else pings it (e.g. UptimeRobot)."
   );
 }
+
+loadCursor();
