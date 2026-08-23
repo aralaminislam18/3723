@@ -232,6 +232,45 @@ messagesRef.on("child_added", (userSnap) => {
       console.error("Call push send failed", err);
     }
   });
+
+  // --- Real-time call-end signal -> lets the OTHER side's ringtone/
+  // notification stop the instant a call is cancelled/ended/declined, even
+  // if that device's Meetlity process is fully killed (a plain Firebase
+  // listener inside the app only works while the app process is alive —
+  // see CallSignalingRepository/IncomingCallActivity). Whenever this user's
+  // copy of a call doc flips to "ended" or "rejected", push a small silent
+  // signal so OneSignalNotificationServiceExtension can cancel the ringing
+  // notification and stop IncomingCallRingtoneService right away instead of
+  // leaving the phone ringing for a call that's already over.
+  //
+  // Note this fires for BOTH participants' copies (calls/{callId} is
+  // mirrored under both users — see CallSignalingRepository), so whichever
+  // side didn't cause the status change is the one who actually needs the
+  // signal; sending it to this userUid regardless is harmless (their own
+  // device already knows, since it's the one that set the status).
+  const callsRef = db.ref(`/users/${userUid}/calls`);
+  const notifiedCallEnds = new Set(); // avoids re-pushing on repeated child_changed events for the same call
+  const notifyCallEndIfNeeded = async (callId, call) => {
+    if (!call || !callId) return;
+    const status = call.status;
+    if (status !== "ended" && status !== "rejected") return;
+    const dedupeKey = `${callId}:${status}`;
+    if (notifiedCallEnds.has(dedupeKey)) return;
+    notifiedCallEnds.add(dedupeKey);
+    try {
+      await sendOneSignalPush({
+        externalId: userUid,
+        headings: "Meetlity",
+        contents: "Call ended",
+        data: { callEndedId: callId, callEndedStatus: status },
+        priority: 10,
+      });
+    } catch (err) {
+      console.error("Call-end push send failed", err);
+    }
+  };
+  callsRef.on("child_added", (snap) => notifyCallEndIfNeeded(snap.key, snap.val()));
+  callsRef.on("child_changed", (snap) => notifyCallEndIfNeeded(snap.key, snap.val()));
 });
 
 function describeNotification(notif, fromName) {
