@@ -17,6 +17,7 @@
 const crypto = require("crypto");
 
 const OTP_NODE = "_otpLogin";
+const USERS_NODE = "messageUsers";   // Chativya ডাটাবেসে ইউজারদের নোড
 const CODE_DIGITS = 8;
 const CODE_TTL_MS = 5 * 60 * 1000;      // ৫ মিনিট
 const RESEND_COOLDOWN_MS = 30 * 1000;   // একই অ্যাকাউন্টে ৩০ সেকেন্ডের আগে নতুন কোড নয়
@@ -119,44 +120,39 @@ function createOtpHandler({ admin, db, sendOneSignalPush }) {
     if (!identifier || identifier.length > 120) return null;
 
     // ---- আলাদা প্রজেক্ট মোড: শুধু Chativya-র ডাটাবেস (মেইন প্রজেক্টে যায় না) ----
+    // ইউজার থাকে messageUsers/{uid} = { username, gmail, name, phone?, uid, ... }
+    // দরকার: Rules এ messageUsers এর নিচে ".indexOn": ["username", "gmail", "phone"]
     if (chatDb) {
-      if (identifier.includes("@")) {
-        // দরকার: Rules এ userProfiles এর নিচে ".indexOn": ["email"]
-        const snap = await chatDb.ref("userProfiles").orderByChild("email")
-          .equalTo(identifier.toLowerCase()).limitToFirst(1).get();
-        let found = null;
-        snap.forEach((c) => { found = c.key; });
-        if (found) return found;
-        const snap2 = await chatDb.ref("userProfiles").orderByChild("email")
-          .equalTo(identifier).limitToFirst(1).get();
-        snap2.forEach((c) => { found = c.key; });
-        return found;
-      }
-      const uk2 = identifier.toLowerCase();
-      const pk2 = identifier.replace(/[^0-9]/g, "");
-      const paths = [];
-      if (USERNAME_KEY.test(uk2)) paths.push(`usernameIndex/${uk2}`);
-      if (PHONE_KEY.test(pk2)) paths.push(`phoneIndex/${pk2}`);
-      for (const path of paths) {
-        const uid = (await chatDb.ref(path).child("uid").get()).val();
-        if (typeof uid === "string" && uid) return uid;
-      }
-      // ইনডেক্সে না পেলে userProfiles এ সরাসরি খোঁজা (দরকার: Rules এ userProfiles এর নিচে ".indexOn": ["username","phone","email"])
       const tries = [];
-      if (USERNAME_KEY.test(uk2)) { tries.push(["username", uk2]); if (identifier !== uk2) tries.push(["username", identifier]); }
-      if (PHONE_KEY.test(pk2)) {
-        tries.push(["phone", identifier]);
-        tries.push(["phone", pk2]);
-        tries.push(["phone", "+" + pk2]);
-        if (pk2.startsWith("880")) tries.push(["phone", "0" + pk2.slice(3)]);
+      if (identifier.includes("@")) {
+        tries.push(["gmail", identifier.toLowerCase()]);
+        if (identifier !== identifier.toLowerCase()) tries.push(["gmail", identifier]);
+      } else {
+        const uk2 = identifier.toLowerCase();
+        const pk2 = identifier.replace(/[^0-9]/g, "");
+        if (USERNAME_KEY.test(uk2)) {
+          tries.push(["username", uk2]);
+          if (identifier !== uk2) tries.push(["username", identifier]);
+        }
+        if (PHONE_KEY.test(pk2)) {
+          tries.push(["phone", identifier]);
+          tries.push(["phone", pk2]);
+          tries.push(["phone", "+" + pk2]);
+          if (pk2.startsWith("880")) tries.push(["phone", "0" + pk2.slice(3)]);
+        }
       }
       for (const [field, val] of tries) {
         try {
-          const snap = await chatDb.ref("userProfiles").orderByChild(field).equalTo(val).limitToFirst(1).get();
+          const snap = await chatDb.ref(USERS_NODE).orderByChild(field).equalTo(val).limitToFirst(1).get();
           let found = null;
-          snap.forEach((c) => { found = c.key; });
+          snap.forEach((c) => {
+            const v = c.val() || {};
+            found = typeof v.uid === "string" && v.uid ? v.uid : c.key;
+          });
           if (found) return found;
-        } catch (e) { /* পরেরটা চেষ্টা */ }
+        } catch (e) {
+          console.error(`lookup ${field} failed:`, e && e.message ? e.message : e);
+        }
       }
       return null;
     }
