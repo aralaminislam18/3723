@@ -15,6 +15,7 @@
 const admin = require("firebase-admin");
 const fetch = require("node-fetch");
 const http = require("http");
+const { createOtpHandler } = require("./otp-login");
 
 const ONESIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID;
 const ONESIGNAL_REST_API_KEY = process.env.ONESIGNAL_REST_API_KEY;
@@ -261,10 +262,12 @@ async function sendOneSignalPush({ externalId, headings, contents, data, priorit
   return true;
 }
 
-// ---- হেলথ সার্ভার ও সেলফ-পিং ---------------------------------------------
+// ---- হেলথ সার্ভার + ওটিপি লগইন রুট ও সেলফ-পিং ---------------------------------------------
 const PORT = process.env.PORT || 3000;
+const otpHandler = createOtpHandler({ admin, db, sendOneSignalPush });
 http
   .createServer((req, res) => {
+    if (otpHandler(req, res)) return;   // /auth/otp/request , /auth/otp/verify
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("Meetlity push server is running.\n");
   })
