@@ -141,6 +141,23 @@ function createOtpHandler({ admin, db, sendOneSignalPush }) {
         const uid = (await chatDb.ref(path).child("uid").get()).val();
         if (typeof uid === "string" && uid) return uid;
       }
+      // ইনডেক্সে না পেলে userProfiles এ সরাসরি খোঁজা (দরকার: Rules এ userProfiles এর নিচে ".indexOn": ["username","phone","email"])
+      const tries = [];
+      if (USERNAME_KEY.test(uk2)) { tries.push(["username", uk2]); if (identifier !== uk2) tries.push(["username", identifier]); }
+      if (PHONE_KEY.test(pk2)) {
+        tries.push(["phone", identifier]);
+        tries.push(["phone", pk2]);
+        tries.push(["phone", "+" + pk2]);
+        if (pk2.startsWith("880")) tries.push(["phone", "0" + pk2.slice(3)]);
+      }
+      for (const [field, val] of tries) {
+        try {
+          const snap = await chatDb.ref("userProfiles").orderByChild(field).equalTo(val).limitToFirst(1).get();
+          let found = null;
+          snap.forEach((c) => { found = c.key; });
+          if (found) return found;
+        } catch (e) { /* পরেরটা চেষ্টা */ }
+      }
       return null;
     }
 
@@ -179,7 +196,11 @@ function createOtpHandler({ admin, db, sendOneSignalPush }) {
 
     // অ্যাকাউন্ট আছে কিনা বোঝা না যায় — তাই না থাকলেও একই উত্তর
     const reply = { ok: true, expiresInSec: CODE_TTL_MS / 1000, resendAfterSec: RESEND_COOLDOWN_MS / 1000 };
-    if (!uid) return json(res, 200, reply);
+    if (!uid) {
+      const idv = String(body.identifier || "");
+      console.log(`OTP request: user NOT FOUND (identifier "${idv.slice(0, 2)}***", len ${idv.length}, mode ${chatDb ? "child-db" : "main-db"})`);
+      return json(res, 200, reply);
+    }
 
     const code = newCode();
     const codeHash = hashCode(uid, code);
@@ -194,7 +215,10 @@ function createOtpHandler({ admin, db, sendOneSignalPush }) {
       if (hourCount >= MAX_PER_HOUR) { throttled = true; return; }
       return { hash: codeHash, createdAt: now, expiresAt: now + CODE_TTL_MS, attempts: 0, hourStart, hourCount: hourCount + 1 };
     });
-    if (throttled) return json(res, 200, reply);
+    if (throttled) {
+      console.log(`OTP request throttled for uid ${uid.slice(0, 6)}…`);
+      return json(res, 200, reply);
+    }
 
     const ok = await sendOneSignalPush({
       externalId: uid,
